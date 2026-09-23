@@ -1,0 +1,279 @@
+-- LUNAR HUB v1.0
+-- Executor: Synapse / Krnl / Solara / others
+-- Target: Roblox games with egg mechanics
+
+local Players = game:GetService("Players")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
+local TweenService = game:GetService("TweenService")
+local LocalPlayer = Players.LocalPlayer
+local Character = LocalPlayer.Character or LocalPlayer.CharacterAdded:Wait()
+local RootPart = Character:WaitForChild("HumanoidRootPart")
+local Humanoid = Character:WaitForChild("Humanoid")
+
+-- ═══════════════════════════════════════
+-- CONFIG
+-- ═══════════════════════════════════════
+local SPEED_MULTIPLIER = 50       -- adjust per game
+local WARP_TARGET_NAME = "Luo"    -- name of the player/area to warp to
+local EGG_STEAL_COOLDOWN = 2      -- seconds between steal attempts
+local AUTO_WARP_INTERVAL = 3      -- seconds between auto-warp loops
+
+local state = {
+    speedOn = false,
+    bypassOn = false,
+    autoWarpOn = false,
+    eggCooldown = 0,
+}
+
+-- ═══════════════════════════════════════
+-- 1. SPEED BOOST (วิ่งเร็ว)
+-- ═══════════════════════════════════════
+local speedConn
+
+local function toggleSpeed(on)
+    state.speedOn = on
+    if on then
+        speedConn = RunService.RenderStepped:Connect(function()
+            Humanoid.WalkSpeed = SPEED_MULTIPLIER
+            Humanoid.JumpPower = 30
+            Humanoid.UseJumpPower = true
+        end)
+    else
+        if speedConn then speedConn:Disconnect() speedConn = nil end
+        Humanoid.WalkSpeed = 16
+        Humanoid.JumpPower = 50
+    end
+end
+
+-- ═══════════════════════════════════════
+-- 2. SPEED BYPASS (บายพาสวิ่งเร็ว)
+-- ═══════════════════════════════════════
+local bypassConn, bypassHeartbeat
+
+local function toggleBypass(on)
+    state.bypassOn = on
+    if on then
+        -- Override server-side speed checks
+        bypassConn = game:GetSignal("Update"):Connect(function(damage)
+            if damage and damage:GetAttribute("BypassBlock") then
+                return
+            end
+        end)
+        -- Force client-side speed cap removal
+        bypassHeartbeat = RunService.Heartbeat:Connect(function()
+            local cap = Humanoid:GetAttribute("MaxSpeedCap")
+            if cap and cap < SPEED_MULTIPLIER then
+                Humanoid:SetAttribute("MaxSpeedCap", SPEED_MULTIPLIER * 2)
+            end
+            -- Some games use a script to reset WalkSpeed each frame
+            -- This reconnects it after they reset
+            if Humanoid.WalkSpeed < SPEED_MULTIPLIER and state.speedOn then
+                Humanoid.WalkSpeed = SPEED_MULTIPLIER
+            end
+        end)
+    else
+        if bypassConn then bypassConn:Disconnect() bypassConn = nil end
+        if bypassHeartbeat then bypassHeartbeat:Disconnect() bypassHeartbeat = nil end
+        Humanoid:SetAttribute("MaxSpeedCap", nil)
+    end
+end
+
+-- ═══════════════════════════════════════
+-- 3. EGG STEAL (ขโมยไข่)
+-- ═══════════════════════════════════════
+local function stealEgg()
+    if state.eggCooldown > 0 then return end
+    state.eggCooldown = EGG_STEAL_COOLDOWN
+    task.delay(EGG_STEAL_COOLDOWN, function() state.eggCooldown = 0 end)
+
+    -- Find egg holders in range
+    for _, other in ipairs(Players:GetPlayers()) do
+        if other == LocalPlayer then continue end
+        local otherChar = other.Character
+        if not otherChar then continue end
+        local otherRoot = otherChar:FindFirstChild("HumanoidRootPart")
+        if not otherRoot then continue end
+
+        -- Check if they're holding/carrying an egg (game-specific)
+        -- Look for common egg parent patterns
+        local eggFound = false
+        for _, obj in ipairs(otherChar:GetDescendants()) do
+            local name = obj.Name:lower()
+            if name:find("egg") or name:find("hatch") or name:find("carry") then
+                -- Teleport into range and trigger steal
+                RootPart.CFrame = otherRoot.CFrame + Vector3.new(0, 2, 0)
+                -- Some games use RemoteEvent for steal, some use proximity
+                -- Try both:
+                local stealEvent = workspace:FindFirstChild("Remotes")
+                    and workspace.Remotes:FindFirstChild("StealEgg")
+                    or workspace.Remotes and workspace.Remotes:FindFirstChild("TakeEgg")
+                if stealEvent then
+                    stealEvent:FireServer(other.Name)
+                else
+                    -- Fallback: proximity-based, just teleport close
+                    RootPart.CFrame = otherRoot.CFrame + Vector3.new(0, 1, 3)
+                end
+                eggFound = true
+                break
+            end
+        end
+        if eggFound then break end
+    end
+end
+
+-- ═══════════════════════════════════════
+-- 4. WARP TO STEAL (วาร์ปไปขโมย)
+-- ═══════════════════════════════════════
+local function warpToSteal()
+    -- Find target player or location
+    local targetPos = nil
+
+    -- Try by player name
+    for _, other in ipairs(Players:GetPlayers()) do
+        if other.Name:lower():find(WARP_TARGET_NAME:lower()) then
+            local otherChar = other.Character
+            if otherChar then
+                local otherRoot = otherChar:FindFirstChild("HumanoidRootPart")
+                if otherRoot then
+                    targetPos = otherRoot.Position
+                    break
+                end
+            end
+        end
+    end
+
+    -- Fallback: find a location named after the target
+    if not targetPos then
+        local marker = workspace:FindFirstChild(WARP_TARGET_NAME)
+            or workspace:FindFirstChild("EggArea")
+            or workspace:FindFirstChild("Hatchery")
+        if marker then
+            targetPos = marker.Position
+        end
+    end
+
+    if targetPos then
+        -- Smooth warp with speed burst
+        local startPos = RootPart.Position
+        local duration = math.clamp(startPos.Magnitude - targetPos.Magnitude, 0.2, 2) / SPEED_MULTIPLIER
+        task.spawn(function()
+            for i = 1, 20 do
+                task.wait()
+                local t = i / 20
+                RootPart.CFrame = RootPart.CFrame:Lerp(
+                    CFrame.lookAt(startPos:lerp(targetPos, t), targetPos), t
+                )
+            end
+            RootPart.CFrame = CFrame.new(targetPos) + Vector3.new(0, 2, 0)
+            -- Auto-trigger steal after arrival
+            task.wait(0.5)
+            stealEgg()
+        end)
+    else
+        print("[LUNAR] Target '" .. WARP_TARGET_NAME .. "' not found")
+    end
+end
+
+-- ═══════════════════════════════════════
+-- 5. AUTO WARP LOOP (ออโต้วาร์ปไปลู่)
+-- ═══════════════════════════════════════
+local autoWarpThread
+
+local function toggleAutoWarp(on)
+    state.autoWarpOn = on
+    if on then
+        autoWarpThread = task.spawn(function()
+            while state.autoWarpOn do
+                warpToSteal()
+                task.wait(AUTO_WARP_INTERVAL)
+            end
+        end)
+    end
+end
+
+-- ═══════════════════════════════════════
+-- GUI — LUNAR HUB
+-- ═══════════════════════════════════════
+local function createGUI()
+    local gui = Instance.new("ScreenGui")
+    gui.Name = "LUNAR_HUB"
+    gui.ResetOnSpawn = false
+    gui.DisplayOrder = 9999
+    gui.Parent = LocalPlayer:WaitForChild("PlayerGui")
+
+    local frame = Instance.new("Frame")
+    frame.Name = "MainFrame"
+    frame.Size = UDim2.new(0, 280, 0, 220)
+    frame.Position = UDim2.new(0.5, -140, 0.5, -110)
+    frame.BackgroundColor3 = Color3.fromRGB(15, 15, 25)
+    frame.BorderSizePixel = 0
+    frame.Parent = gui
+
+    local corner = Instance.new("UICorner")
+    corner.CornerRadius = UDim.new(0, 12)
+    corner.Parent = frame
+
+    -- Title
+    local title = Instance.new("TextLabel")
+    title.Size = UDim2.new(1, 0, 0, 36)
+    title.Position = UDim2.new(0, 0, 0, 0)
+    title.BackgroundTransparency = 1
+    title.Text = "☽ LUNAR HUB"
+    title.TextColor3 = Color3.fromRGB(180, 140, 255)
+    title.TextSize = 20
+    title.Font = Enum.Font.GothamBold
+    title.Parent = frame
+
+    local buttons = {
+        { label = "⚡ Speed", key = "speedOn", fn = function(on) toggleSpeed(on); toggleBypass(on) end },
+        { label = "🔒 Bypass", key = "bypassOn", fn = function(on) toggleBypass(on) end },
+        { label = "🥚 Steal Egg", action = stealEgg },
+        { label = "📍 Warp+Steal", action = warpToSteal },
+        { label = "🔄 Auto Warp", key = "autoWarpOn", fn = toggleAutoWarp },
+    }
+
+    for i, btn in ipairs(buttons) do
+        local b = Instance.new("TextButton")
+        b.Size = UDim2.new(1, -20, 0, 34)
+        b.Position = UDim2.new(0, 10, 0, 44 + (i - 1) * 38)
+        b.BackgroundColor3 = Color3.fromRGB(40, 40, 60)
+        b.Text = btn.label
+        b.TextColor3 = Color3.fromRGB(220, 220, 240)
+        b.TextSize = 15
+        b.Font = Enum.Font.GothamMedium
+        b.Parent = frame
+
+        local bCorner = Instance.new("UICorner")
+        bCorner.CornerRadius = UDim.new(0, 8)
+        bCorner.Parent = b
+
+        b.MouseButton1Click:Connect(function()
+            if btn.action then
+                btn.action()
+            elseif btn.fn then
+                state[btn.key] = not state[btn.key]
+                btn.fn(state[btn.key])
+                b.BackgroundColor3 = state[btn.key]
+                    and Color3.fromRGB(100, 60, 180)
+                    or Color3.fromRGB(40, 40, 60)
+            end
+        end)
+    end
+
+    -- Keybind: H to toggle GUI
+    UserInputService.InputBegan:Connect(function(input, gpe)
+        if gpe then return end
+        if input.KeyCode == Enum.KeyCode.H then
+            gui.Enabled = not gui.Enabled
+        end
+    end)
+
+    print("[LUNAR HUB] Loaded. Press H to toggle GUI.")
+end
+
+-- ═══════════════════════════════════════
+-- INIT
+-- ═══════════════════════════════════════
+createGUI()
+print("[LUNAR HUB] v1.0 — ready, BZMEMBER")
